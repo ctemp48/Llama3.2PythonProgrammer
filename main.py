@@ -25,9 +25,13 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import wandb
 
 #interpreter_login()
+seed = 42
+set_seed(seed)
 
 load_dotenv()
 wandb.login(key=os.getenv('wandb-key'))
+
+CUTOFF_LEN = 256
 
 dataset = load_dataset("gbharti/wealth-alpaca_lora")
 dataset = dataset['train'].train_test_split(test_size = 0.2)
@@ -37,7 +41,6 @@ bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type='nf4',
         bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=False,
     )
 
 model_name="meta-llama/Llama-3.2-3B-Instruct"
@@ -45,99 +48,61 @@ device_map = {"": 0}
 original_model = AutoModelForCausalLM.from_pretrained(model_name, 
                                                       device_map = device_map,
                                                       quantization_config=bnb_config,
-                                                      trust_remote_code=True,
                                                       use_auth_token=True)
 
-tokenizer = AutoTokenizer.from_pretrained(model_name,trust_remote_code=True,padding_side="left",add_eos_token=True,add_bos_token=True,use_fast=False)
-tokenizer.pad_token = tokenizer.eos_token
+tokenizer = AutoTokenizer.from_pretrained(model_name, add_eos_token=True)
+tokenizer.pad_token = 0
 
-def create_prompt_formats(sample):
-    if sample['input']:
-        text = 'Below is an instruction that describes a task, paired with an input that provides' \
-               ' further context. Write a response that appropriately completes the request.\n\n'
-        text += f'### Instruction:\n{sample["instruction"]}\n\n'
-        text += f'### Input:\n{sample["input"]}\n\n'
-        text += f'### Response:\n{sample["output"]}'
-        sample['text'] = text
-        return sample
-    
+def generate_and_tokenize_prompt(data_point):
+    """This function masks out the labels for the input, so that our loss is computed only on the
+    response."""
+    if data_point['input']:
+        user_prompt = 'Below is an instruction that describes a task, paired with an input that ' \
+                      'provides further context. Write a response that appropriately completes ' \
+                      'the request.\n\n'
+        user_prompt += f'### Instruction:\n{data_point["instruction"]}\n\n'
+        user_prompt += f'### Input:\n{data_point["input"]}\n\n'
+        user_prompt += f'### Response:\n'
     else:
-        text = 'Below is an instruction that describes a task. Write a response that ' \
-               'appropriately completes the request.\n\n'
-        text += f'### Instruction:\n{sample["instruction"]}\n\n'
-        text += f'### Response:\n{sample["output"]}'
-        sample['text'] = text
-        return sample
+        user_prompt = 'Below is an instruction that describes a task. Write a response that ' \
+                      'appropriately completes the request.'
+        user_prompt += f'### Instruction:\n{data_point["instruction"]}\n\n'
+        user_prompt += f'### Response:\n'
 
+    # Count the length of prompt tokens
+    len_user_prompt_tokens = len(tokenizer(user_prompt,
+                                           truncation=True,
+                                           max_length=CUTOFF_LEN + 1,
+                                           padding='max_length')['input_ids'])
+    len_user_prompt_tokens -= 1  # Minus 1 (one) for eos token
 
-def get_max_length(model):
-    max_length = None
-    for length_setting in ["n_positions", "max_position_embeddings", "seq_length"]:
-        max_length = getattr(model.config, length_setting, None)
-        if max_length:
-            print(f"Found max lenth: {max_length}")
-            break
-    if not max_length:
-        max_length = 1024
-        print(f"Using default max length: {max_length}")
-    return max_length
-
-def preprocess_batch(batch, tokenizer, max_length):
-    """
-    Tokenizing a batch
-    """
-    return tokenizer(
-        batch["text"],
-        max_length=max_length,
+    # Tokenise the input, both prompt and output
+    full_tokens = tokenizer(
+        user_prompt + data_point['output'],
         truncation=True,
-    )
+        max_length=CUTOFF_LEN + 1,
+        padding='max_length',
+    )['input_ids'][:-1]
+    return {
+        'input_ids': full_tokens,
+        'labels': [-100] * len_user_prompt_tokens + full_tokens[len_user_prompt_tokens:],
+        'attention_mask': [1] * (len(full_tokens)),
+    }
 
-def preprocess_dataset(tokenizer: AutoTokenizer, max_length: int,seed, dataset):
-    """Format & tokenize it so it is ready for training
-    :param tokenizer (AutoTokenizer): Model Tokenizer
-    :param max_length (int): Maximum number of tokens to emit from tokenizer
-    """
-    
-    # Add prompt to each sample
-    print("Preprocessing dataset...")
-    dataset = dataset.map(create_prompt_formats)#, batched=True)
-    
-    # Apply preprocessing to each batch of the dataset & and remove 'instruction', 'context', 'response', 'category' fields
-    _preprocessing_function = partial(preprocess_batch, max_length=max_length, tokenizer=tokenizer)
-    dataset = dataset.map(
-        _preprocessing_function,
-        batched=True,
-        remove_columns=['instruction', 'output', 'input'],
-    )
 
-    # Filter out samples that have input_ids exceeding max_length
-    dataset = dataset.filter(lambda sample: len(sample["input_ids"]) < max_length)
-    
-    # Shuffle dataset
-    dataset = dataset.shuffle(seed=seed)
-
-    return dataset
-
-seed = 42
-set_seed(seed)
-
-max_length = get_max_length(original_model)
-
-train_dataset = preprocess_dataset(tokenizer, max_length, seed, dataset['train'])
-test_dataset = preprocess_dataset(tokenizer, max_length, seed, dataset['test'])
+train_dataset = dataset['train'].map(generate_and_tokenize_prompt)
+test_dataset = dataset['test'].map(generate_and_tokenize_prompt)
 
 original_model = prepare_model_for_kbit_training(original_model)
 
 config = LoraConfig(  #fiddle around with these
-    r=32, #Rank
-    lora_alpha=32,
+    r=8, #Rank
+    lora_alpha=8,
     target_modules="all-linear",
     bias="none",
     lora_dropout=0.05,  # Conventional
     task_type="CAUSAL_LM",
 )
-
-original_model.gradient_checkpointing_enable()
 
 peft_model = get_peft_model(original_model, config)
 
@@ -151,16 +116,14 @@ peft_training_args = TrainingArguments( #fiddle around with these
     output_dir = output_dir,
     warmup_steps=1,
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=4,
-    max_steps=1000,
+    gradient_accumulation_steps=1,
     learning_rate=2e-4,
-    optim="paged_adamw_8bit",
-    logging_steps=25,
+    logging_steps=20,
     logging_dir="./logs",
     save_strategy="steps",
-    save_steps=25,
+    save_steps=50,
     evaluation_strategy="steps",
-    eval_steps=25,
+    eval_steps=50,
     do_eval=True,
     gradient_checkpointing=True,
     report_to="none",
@@ -179,4 +142,5 @@ peft_trainer = Trainer(
 )
 
 peft_trainer.train()
+wandb.finish()
 
