@@ -30,11 +30,12 @@ set_seed(seed)
 
 load_dotenv()
 wandb.login(key=os.getenv('wandb-key'))
-
+os.environ["WANDB_PROJECT"] = 'LlamaFinance'
+os.environ["WANDB_LOG_MODEL"] = "end"
 CUTOFF_LEN = 256
 
 dataset = load_dataset("gbharti/wealth-alpaca_lora")
-dataset = dataset['train'].train_test_split(test_size = 0.2)
+dataset = dataset['train'].train_test_split(test_size = 0.1)
 
 compute_dtype = getattr(torch, "float16")
 bnb_config = BitsAndBytesConfig(
@@ -51,7 +52,7 @@ original_model = AutoModelForCausalLM.from_pretrained(model_name,
                                                       use_auth_token=True)
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, add_eos_token=True)
-tokenizer.pad_token = 0
+tokenizer.pad_token = tokenizer.eos_token
 
 def generate_and_tokenize_prompt(data_point):
     """This function masks out the labels for the input, so that our loss is computed only on the
@@ -74,7 +75,7 @@ def generate_and_tokenize_prompt(data_point):
                                            truncation=True,
                                            max_length=CUTOFF_LEN + 1,
                                            padding='max_length')['input_ids'])
-    len_user_prompt_tokens -= 1  # Minus 1 (one) for eos token
+    len_user_prompt_tokens -= 1  # Minus 1 for eos token
 
     # Tokenise the input, both prompt and output
     full_tokens = tokenizer(
@@ -90,14 +91,14 @@ def generate_and_tokenize_prompt(data_point):
     }
 
 
-train_dataset = dataset['train'].map(generate_and_tokenize_prompt)
-test_dataset = dataset['test'].map(generate_and_tokenize_prompt)
+train_dataset = dataset['train'].map(generate_and_tokenize_prompt, batched=True)
+test_dataset = dataset['test'].map(generate_and_tokenize_prompt, batched=True)
 
 original_model = prepare_model_for_kbit_training(original_model)
 
 config = LoraConfig(  #fiddle around with these
     r=8, #Rank
-    lora_alpha=8,
+    lora_alpha=32,
     target_modules="all-linear",
     bias="none",
     lora_dropout=0.05,  # Conventional
@@ -106,7 +107,8 @@ config = LoraConfig(  #fiddle around with these
 
 peft_model = get_peft_model(original_model, config)
 
-#print(peft_model.print_trainable_parameters())
+print(peft_model.print_trainable_parameters())
+exit()
 
 output_dir = f'./peft-dialogue-summary-training-{str(int(time.time()))}'
 
@@ -114,21 +116,17 @@ peft_training_args = TrainingArguments( #fiddle around with these
     seed=seed,
     data_seed=seed,
     output_dir = output_dir,
-    warmup_steps=1,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=1,
-    learning_rate=2e-4,
-    logging_steps=20,
-    logging_dir="./logs",
-    save_strategy="steps",
-    save_steps=50,
-    evaluation_strategy="steps",
-    eval_steps=50,
-    do_eval=True,
     gradient_checkpointing=True,
-    report_to="none",
-    overwrite_output_dir = 'True',
-    group_by_length=True,
+    gradient_accumulation_steps=2,
+    auto_find_batch_size=True,
+    num_train_epochs=5,
+    learning_rate=2e-4,
+    bf16=True,
+    save_total_limit=4,
+    logging_steps=10,
+    save_strategy='steps',
+    save_steps=500,
+    report_to='wandb',
 )
 
 peft_model.config.use_cache = False
@@ -142,5 +140,5 @@ peft_trainer = Trainer(
 )
 
 peft_trainer.train()
-wandb.finish()
+
 
