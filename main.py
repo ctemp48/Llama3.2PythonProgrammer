@@ -30,7 +30,7 @@ set_seed(seed)
 
 load_dotenv()
 wandb.login(key=os.getenv('wandb-key'))
-os.environ["WANDB_PROJECT"] = 'LlamaFinance'
+os.environ["WANDB_PROJECT"] = 'Llama3.2Finance'
 os.environ["WANDB_LOG_MODEL"] = "end"
 CUTOFF_LEN = 256
 
@@ -91,8 +91,13 @@ def generate_and_tokenize_prompt(data_point):
     }
 
 
-train_dataset = dataset['train'].map(generate_and_tokenize_prompt, batched=True)
-test_dataset = dataset['test'].map(generate_and_tokenize_prompt, batched=True)
+train_dataset = dataset['train'].map(generate_and_tokenize_prompt)
+test_dataset = dataset['test'].map(generate_and_tokenize_prompt)
+
+#small_train_dataset = dataset['train'].shuffle(seed=42).select(range(100)).map(generate_and_tokenize_prompt)  # Use only 100 samples
+#small_test_dataset = dataset['test'].shuffle(seed=42).select(range(20)).map(generate_and_tokenize_prompt)
+
+
 
 original_model = prepare_model_for_kbit_training(original_model)
 
@@ -108,25 +113,23 @@ config = LoraConfig(  #fiddle around with these
 peft_model = get_peft_model(original_model, config)
 
 print(peft_model.print_trainable_parameters())
-exit()
 
-output_dir = f'./peft-dialogue-summary-training-{str(int(time.time()))}'
 
-peft_training_args = TrainingArguments( #fiddle around with these
+peft_training_args = TrainingArguments( 
+    #fiddle around with these
     seed=seed,
     data_seed=seed,
-    output_dir = output_dir,
+    output_dir = "./peft-full-run",
     gradient_checkpointing=True,
-    gradient_accumulation_steps=2,
+    #gradient_accumulation_steps=2,
     auto_find_batch_size=True,
     num_train_epochs=5,
     learning_rate=2e-4,
     bf16=True,
     save_total_limit=4,
     logging_steps=10,
-    save_strategy='steps',
-    save_steps=500,
-    report_to='wandb',
+    save_strategy='epoch',
+    report_to='wandb'
 )
 
 peft_model.config.use_cache = False
@@ -139,6 +142,14 @@ peft_trainer = Trainer(
     data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
 )
 
+
+def print_memory_usage():
+    allocated = torch.cuda.memory_allocated() / 1e9  # Convert to GB
+    reserved = torch.cuda.memory_reserved() / 1e9  # Convert to GB
+    print(f"Allocated VRAM: {allocated:.2f} GB | Reserved VRAM: {reserved:.2f} GB")
+
+print_memory_usage()  # Print memory usage before training
 peft_trainer.train()
+print_memory_usage()  # Print memory usage after training
 
 
