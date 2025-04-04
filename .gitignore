@@ -2,3 +2,7 @@ venv
 .env
 peft-test-run
 peft-full-run
+CodeXGLUE
+code_eval_container
+results
+fine-tuned-llama-3-1b
